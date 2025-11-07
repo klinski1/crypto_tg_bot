@@ -1,0 +1,27 @@
+# ───── СЕКРЕТЫ (НИКОГДА НЕ ЗАЛИВАЙ!) ─────
+secrets.env
+.env
+.env.local
+*.key
+*.pem
+
+# ───── Python мусор ─────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# ───── Docker ─────
+docker-compose.override.yml
+
+# ───── Локальные IDE ─────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ───── Временные файлы ─────
+*.tmp
+*.bak
+.DS_Store
