@@ -1,15 +1,12 @@
-import json, os, requests, time
+import json, os, requests
 from flask import Flask, request
 from functools import lru_cache
-from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
-# Секреты из .env
+# Секреты (только нужные)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 XAI   = os.getenv("XAI_API_KEY")
-ENCRYPT_KEY = os.getenv("ENCRYPTION_KEY")
-fernet = Fernet(ENCRYPT_KEY) if ENCRYPT_KEY else None
 
 # Кэш Binance
 @lru_cache(maxsize=64)
@@ -162,5 +159,5 @@ def webhook():
     return "OK", 200
 
 if __name__ == '__main__':
-    print("Q-Engine v2 запущен на http://0.0.0.0:5000")
+    print("Q-Engine v2 — ЛОКАЛЬНЫЙ РЕЖИМ (без шифрования)")
     app.run(host='0.0.0.0', port=5000)
