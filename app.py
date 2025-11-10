@@ -91,20 +91,38 @@ Return ONLY JSON:
         return {"signal":"HOLD","confidence":0,"reason":"Offline"}
 
 def make_reply(signal, ticker):
-    e = "UP" if signal["signal"] == "LONG" else "DOWN" if signal["signal"] == "SHORT" else "NEUTRAL"
-    text = f"""*{ticker}/USDT* → *{signal['signal']}* {e}
-Target: `{signal['target_pct']:+.1f}%` | Stop: `{signal['stop_pct']:+.1f}%`
-Confidence: `{signal['confidence']}%`
+    # Защита от кривого ответа Grok
+    sig = signal.get("signal", "HOLD").upper()
+    target = float(signal.get("target_pct", 0))
+    stop = float(signal.get("stop_pct", 0))
+    conf = int(signal.get("confidence", 0))
+    reason = str(signal.get("reason", "No data")).strip()
 
-_{signal['reason']}_"""
+    # Если Grok вернул мусор — ставим безопасные значения
+    if sig not in ["LONG", "SHORT", "HOLD"]:
+        sig = "HOLD"
+    if not (3.0 <= target <= 14.0):
+        target = 0.0
+    if not (-3.5 <= stop <= -1.0):
+        stop = 0.0
+    if not (80 <= conf <= 99):
+        conf = 0
 
-    keyboard = {"inline_keyboard": [[
-        {"text": "LONG", "callback_data": f"LONG {ticker}"},
-        {"text": "SHORT", "callback_data": f"SHORT {ticker}"},
-        {"text": "Update", "callback_data": f"UPDATE {ticker}"}
-    ]]}
+    emoji = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
+    text = f"""*{ticker}/USDT* → *{sig}* {emoji}
+Target: `{target:+.1f}%` | Stop: `{stop:+.1f}%`
+Confidence: `{conf}%`
+
+_{reason}_"""
+
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "LONG", "callback_data": f"LONG {ticker}"},
+            {"text": "SHORT", "callback_data": f"SHORT {ticker}"},
+            {"text": "Update", "callback_data": f"UPDATE {ticker}"}
+        ]]
+    }
     return text, keyboard
-
 def send(chat_id, text, keyboard=None, edit=None):
     url = f"https://api.telegram.org/bot{TOKEN}/{'editMessageText' if edit else 'sendMessage'}"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
