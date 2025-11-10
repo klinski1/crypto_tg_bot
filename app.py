@@ -155,7 +155,8 @@ def webhook():
                 answer_callback(cq['id'], "Ты выбрал " + data)
 
     except Exception as e:
-        print(e)
+        error_msg = f"[GROK ERROR] {type(e).__name__}: {e}"
+        print(error_msg)
     return "OK", 200
 
 if __name__ == '__main__':
