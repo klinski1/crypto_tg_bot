@@ -117,6 +117,7 @@ def answer_callback(qid, text="OK"):
                   json={"callback_query_id": qid, "text": text}, timeout=5)
 
 @app.route('/webhook', methods=['POST'])
+@app.route('/', methods=['POST'])
 def webhook():
     try:
         update = request.get_json()
