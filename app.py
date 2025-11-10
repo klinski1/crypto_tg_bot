@@ -116,50 +116,73 @@ def answer_callback(qid, text="OK"):
     requests.post(f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
                   json={"callback_query_id": qid, "text": text}, timeout=5)
 
-@app.route('/webhook', methods=['POST'])
 @app.route('/', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
+    print("[HOOK] ← ВХОДЯЩИЙ запрос от Telegram")
     try:
-        update = request.get_json()
+        update = request.get_json(force=True)
+        print(f"[HOOK] JSON получен: {json.dumps(update)[:200]}...")
+
         if 'message' in update:
+            print("[HOOK] Это обычное сообщение")
             msg = update['message']
             chat_id = msg['chat']['id']
-            text = msg.get('text','').strip().upper()
+            text = msg.get('text', '').strip().upper()
+            print(f"[HOOK] Текст от {chat_id}: {text}")
 
             if text == '/START':
+                print("[HOOK] Отправляю приветствие")
                 send(chat_id, "*Q-Engine v2 готов!*\\nОтправь тикер → BTC")
                 return "OK", 200
 
             if not (2 <= len(text) <= 10 and text.replace('USDT','').isalnum()):
+                print("[HOOK] Некорректный тикер")
                 send(chat_id, "Тикер: BTC, ETH, SOL…")
                 return "OK", 200
 
+            print(f"[HOOK] Отправляю '_Анализирую…_' для {text}")
             send(chat_id, "_Анализирую…_")
+
+            print(f"[HOOK] → Запускаю grok({text.replace('USDT','')})")
             signal = grok(text.replace('USDT',''))
+            print(f"[HOOK] ← grok вернул: {signal}")
+
             reply, kb = make_reply(signal, text)
+            print(f"[HOOK] Отправляю ответ с кнопками")
             send(chat_id, reply, kb)
 
         elif 'callback_query' in update:
+            print("[HOOK] Это callback от кнопки")
             cq = update['callback_query']
             data = cq['data']
             chat_id = cq['message']['chat']['id']
             msg_id = cq['message']['message_id']
+            print(f"[HOOK] Callback: {data}")
 
             if data.startswith("UPDATE"):
                 ticker = data.split()[1]
+                print(f"[HOOK] UPDATE {ticker}")
                 send(chat_id, "_Обновляю…_", edit=msg_id)
                 signal = grok(ticker)
+                print(f"[HOOK] ← grok UPDATE вернул: {signal}")
                 reply, kb = make_reply(signal, ticker)
                 send(chat_id, reply, kb, edit=msg_id)
                 answer_callback(cq['id'], "Обновлено!")
             else:
                 answer_callback(cq['id'], "Ты выбрал " + data)
 
-    except Exception as e:
-        error_msg = f"[GROK ERROR] {type(e).__name__}: {e}"
-        print(error_msg)
-    return "OK", 200
+        else:
+            print("[HOOK] Неизвестный тип update")
 
+    except Exception as e:
+        error_msg = f"[FATAL ERROR] {type(e).__name__}: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+
+    print("[HOOK] → Возвращаю OK")
+    return "OK", 200
 if __name__ == '__main__':
     print("Q-Engine v2 — ЛОКАЛЬНЫЙ РЕЖИМ (без шифрования)")
     app.run(host='0.0.0.0', port=5000)
