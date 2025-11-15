@@ -76,13 +76,13 @@ No extra text. No markdown. No code blocks."""
             r = requests.post(
                 "https://api.x.ai/v1/chat/completions",
                 json={
-                    "model": "grok-4-latest",  # ← Стабильная модель
+                    "model": "grok-4-latest", 
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.0,
                     "max_tokens": 120
                 },
                 headers={"Authorization": f"Bearer {XAI}"},
-                timeout=30  # ← УВЕЛИЧИЛИ ДО 30 СЕК
+                timeout=30  
             )
             print(f"[GROK] Status: {r.status_code}")
             r.raise_for_status()
@@ -106,40 +106,49 @@ No extra text. No markdown. No code blocks."""
             time.sleep(2)  # Пауза перед retry
         except Exception as e:
             print(f"[GROK ERROR] {type(e).__name__}: {e}")
-            return {"signal":"HOLD","confidence":0,"reason":"Offline"}   
-def make_reply(signal, ticker):
-    # Защита от кривого ответа Grok
-    sig = signal.get("signal", "HOLD").upper()
-    target = float(signal.get("target_pct", 0))
-    stop = float(signal.get("stop_pct", 0))
-    conf = int(signal.get("confidence", 0))
-    reason = str(signal.get("reason", "No data")).strip()
+            return {"signal":"HOLD","confidence":0,"reason":"Offline"}  
 
-    # Если Grok вернул мусор — ставим безопасные значения
+def make_reply(signal, ticker):
+    sig = signal.get("signal", "HOLD").upper()
+    target_pct = float(signal.get("target_pct", 0))
+    stop_pct = float(signal.get("stop_pct", 0))
+    conf = int(signal.get("confidence", 0))
+    reason = str(signal.get("reason", "No edge")).strip()
+
+    # Защита
     if sig not in ["LONG", "SHORT", "HOLD"]:
         sig = "HOLD"
-    if not (3.0 <= target <= 14.0):
-        target = 0.0
-    if not (-3.5 <= stop <= -1.0):
-        stop = 0.0
+    if not (3.0 <= target_pct <= 14.0):
+        target_pct = 0.0
+    if not (-3.5 <= stop_pct <= -1.0):
+        stop_pct = 0.0
     if not (80 <= conf <= 99):
         conf = 0
 
-    emoji = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
-    text = f"""*{ticker}/USDT* → *{sig}* {emoji}
-Target: `{target:+.1f}%` | Stop: `{stop:+.1f}%`
+    # Цена
+    price_data = get_binance_data(ticker.replace('USDT',''))
+    price = f"${float(price_data['price']):,.0f}"
+    current_price = float(price_data['price'])
+    target_price = f"${current_price * (1 + target_pct/100):,.0f}"
+    stop_price = f"${current_price * (1 + stop_pct/100):,.0f}"
+
+    arrow = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
+
+    text = f"""*{ticker}/USDT* → *{sig}* {arrow}
+Price: `{price}`
+Target: `{target_price}` (`{target_pct:+.1f}%`) | Stop: `{stop_price}` (`{stop_pct:+.1f}%`)
 Confidence: `{conf}%`
 
-_{reason}_"""
+_{reason.replace('|', ' | ')}_"""
 
+    # ТОЛЬКО UPDATE
     keyboard = {
         "inline_keyboard": [[
-            {"text": "LONG", "callback_data": f"LONG {ticker}"},
-            {"text": "SHORT", "callback_data": f"SHORT {ticker}"},
             {"text": "Update", "callback_data": f"UPDATE {ticker}"}
         ]]
     }
     return text, keyboard
+
 def send(chat_id, text, keyboard=None, edit=None):
     url = f"https://api.telegram.org/bot{TOKEN}/{'editMessageText' if edit else 'sendMessage'}"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
@@ -188,24 +197,20 @@ def webhook():
             send(chat_id, reply, kb)
 
         elif 'callback_query' in update:
-            print("[HOOK] Это callback от кнопки")
+            print("[HOOK] Callback")
             cq = update['callback_query']
             data = cq['data']
             chat_id = cq['message']['chat']['id']
             msg_id = cq['message']['message_id']
-            print(f"[HOOK] Callback: {data}")
 
             if data.startswith("UPDATE"):
                 ticker = data.split()[1]
                 print(f"[HOOK] UPDATE {ticker}")
                 send(chat_id, "_Обновляю…_", edit=msg_id)
                 signal = grok(ticker)
-                print(f"[HOOK] ← grok UPDATE вернул: {signal}")
                 reply, kb = make_reply(signal, ticker)
                 send(chat_id, reply, kb, edit=msg_id)
                 answer_callback(cq['id'], "Обновлено!")
-            else:
-                answer_callback(cq['id'], "Ты выбрал " + data)
 
         else:
             print("[HOOK] Неизвестный тип update")
