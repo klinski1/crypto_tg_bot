@@ -198,17 +198,21 @@ Return JSON:
             time.sleep(2)
     return {"signal": "HOLD", "confidence": 0, "reason": "Timeout"}
 
-# === REPLY ===
 def make_reply(signal: dict, ticker: str):
-    sig = signal["signal"]
+    # Получаем свежие данные
     data = get_binance_data(ticker)
+    if "error" in data:
+        return "_Данные недоступны…_", None
+
+    sig = signal["signal"]
     price = data["price"]
-    target_price = price * (1 + signal["target_pct"]/100)
-    stop_price = price * (1 + signal["stop_pct"]/100)
+    target_price = price * (1 + signal["target_pct"] / 100)
+    stop_price = price * (1 + signal["stop_pct"] / 100)
 
     arrow = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
     div = "DIVERGENCE!" if "div" in signal["reason"].lower() else ""
-    poc = f"POC: {data['poc_price']}" if 'poc_price' in data else ""
+    poc = f"POC: {data.get('poc_price', 'N/A')}"
+    liq = f"LIQ: {get_liquidation_cluster(ticker)}"
 
     text = f"""*{ticker}/USDT* → *{sig}* {arrow}
 Price: `${price:,.0f}`
@@ -217,7 +221,7 @@ Confidence: `{signal['confidence']}%`
 
 _{signal['reason']}_
 
-**{div} {poc}**
+**{div} {poc} {liq}**
 
 [ Update ]"""
 
