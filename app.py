@@ -1,302 +1,253 @@
-import json, os, requests
-from flask import Flask, request
+import os
+import json
+import time
+import requests
+from typing import Dict, Any
+from flask import Flask, request, jsonify
 from functools import lru_cache
-from typing import Dict
-from time import time
 
+# === CONFIG ===
 app = Flask(__name__)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+XAI_API_KEY    = os.getenv("XAI_API_KEY")
+BYBIT_API_URL  = "https://api.bybit.com"
+BINANCE_API_URL = "https://api.binance.com"
 
-# Секреты (только нужные)
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-XAI   = os.getenv("XAI_API_KEY")
+# === UTILS ===
+def send_telegram(chat_id: int, text: str, keyboard: dict = None, edit: int = None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    if edit:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+        payload["message_id"] = edit
+    requests.post(url, json=payload, timeout=5)
 
-# Кэш Binance
-@lru_cache(maxsize=64)
-def get_binance_data(ticker: str) -> Dict:
+# === RSI ===
+def calculate_rsi(prices: list[float], period: int = 14) -> float:
+    if len(prices) <= period:
+        return 50.0
+    gains = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
+    losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period or 1e-10
+    rs = avg_gain / avg_loss
+    return round(100 - 100 / (1 + rs), 1)
+
+# === EMA ===
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    k = 2 / (period + 1)
+    ema_val = values[0]
+    for p in values[1:]:
+        ema_val = p * k + ema_val * (1 - k)
+    return ema_val
+
+# === BINANCE DATA + POC + DIVERGENCE ===
+@lru_cache(maxsize=32)
+def get_binance_data(ticker: str) -> Dict[str, Any]:
     symbol = f"{ticker}USDT"
     try:
-        # SPOT + TECHNICAL
-        spot = requests.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": symbol},
-            timeout=5
-        ).json()
-
-        # KLINES для индикаторов
+        # Klines: 1h, 100 candles
         klines = requests.get(
-            "https://api.binance.com/api/v3/klines",
+            f"{BINANCE_API_URL}/api/v3/klines",
             params={"symbol": symbol, "interval": "1h", "limit": 100},
-            timeout=5
+            timeout=7
         ).json()
 
         closes = [float(k[4]) for k in klines]
         volumes = [float(k[5]) for k in klines]
 
-        # EMA-20 / EMA-50
-        def ema(values, period):
-            k = 2 / (period + 1)
-            ema_val = values[0]
-            for price in values[1:]:
-                ema_val = price * k + ema_val * (1 - k)
-            return ema_val
-
+        # === Indicators ===
         ema20 = ema(closes[-20:], 20)
         ema50 = ema(closes[-50:], 50)
+        ema_cross = "bull" if ema20 > ema50 else "bear"
 
-        # MACD
         ema12 = ema(closes[-12:], 12)
         ema26 = ema(closes[-26:], 26)
         macd_line = ema12 - ema26
-        signal_line = ema([macd_line] * 9, 9)  # упрощённо
-        macd_hist = macd_line - signal_line
+        macd_hist = macd_line - ema([macd_line] * 9, 9)
 
-        # OBV
-        obv = 0
-        for i in range(1, len(closes)):
-            if closes[i] > closes[i-1]:
-                obv += volumes[i]
-            elif closes[i] < closes[i-1]:
-                obv -= volumes[i]
-        obv_change = (obv - sum(volumes[-24:-1])) / 1e6  # млн
+        rsi = calculate_rsi(closes, 14)
 
-        # FUTURES DATA
-        futures = requests.get(
-            "https://fapi.binance.com/fapi/v1/premiumIndex",
-            params={"symbol": symbol},
-            timeout=5
-        ).json()
+        avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
+        vol_spike = round(volumes[-1] / avg_vol, 1)
 
-        oi = requests.get(
-            "https://fapi.binance.com/fapi/v1/openInterest",
-            params={"symbol": symbol},
-            timeout=5
-        ).json()
+        # === POC (Volume Profile) ===
+        price_min, price_max = min(closes), max(closes)
+        bin_size = (price_max - price_min) / 20 or 1
+        profile = {}
+        for i, price in enumerate(closes):
+            bin_key = round(price / bin_size) * bin_size
+            profile[bin_key] = profile.get(bin_key, 0) + volumes[i]
+        poc_price = max(profile, key=profile.get, default=closes[-1])
 
-        ls_ratio = requests.get(
-            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-            params={"symbol": symbol, "period": "5m", "limit": 1},
-            timeout=5
-        ).json()[0]
+        # === Divergence (last 40 candles) ===
+        rsi_vals = [calculate_rsi(closes[:i+1], 14) for i in range(13, len(closes))]
+        macd_vals = []
+        for i in range(26, len(closes)):
+            e12 = ema(closes[:i+1][-12:], 12)
+            e26 = ema(closes[:i+1][-26:], 26)
+            macd_vals.append(e12 - e26)
 
-        # Сбор данных
+        # Lows
+        lows_idx = [i for i in range(-40, 0) if closes[i] == min(closes[-40:])]
+        rsi_div = macd_div = "none"
+        if len(lows_idx) >= 2:
+            i1, i2 = lows_idx[-2], lows_idx[-1]
+            p1, p2 = closes[i1], closes[i2]
+            r1, r2 = rsi_vals[i1-13], rsi_vals[i2-13]
+            m1, m2 = macd_vals[i1-26], macd_vals[i2-26]
+            if p2 < p1 and r2 > r1:
+                rsi_div = "bullish_rsi"
+            if p2 > p1 and r2 < r1:
+                rsi_div = "bearish_rsi"
+            if p2 < p1 and m2 > m1:
+                macd_div = "bullish_macd"
+            if p2 > p1 and m2 < m1:
+                macd_div = "bearish_macd"
+
+        # === Futures ===
+        funding = requests.get(f"{BINANCE_API_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=5).json()
+        oi = requests.get(f"{BINANCE_API_URL}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=5).json()
+        ls = requests.get(f"{BINANCE_API_URL}/futures/data/globalLongShortAccountRatio", params={"symbol": symbol, "period": "5m", "limit": 1}, timeout=5).json()[0]
+
         return {
-            "price": spot['lastPrice'],
-            "change": f"{float(spot['priceChangePercent']):+.1f}%",
-            "rsi": calculate_rsi(closes, 14),
-            "funding": f"{float(futures['lastFundingRate']):+.3f}%",
-            "volume_spike": f"x{round(float(spot['volume']) / (sum(volumes[:-1])/len(volumes[:-1])), 1)}",
+            "price": closes[-1],
+            "change": f"{(closes[-1]/closes[0]-1)*100:+.1f}%",
+            "rsi": rsi,
+            "funding": f"{float(funding['lastFundingRate'])*100:+.3f}%",
+            "volume_spike": f"x{vol_spike}",
             "ema20": f"${ema20:,.0f}",
             "ema50": f"${ema50:,.0f}",
-            "macd": round(macd_line, 0),
-            "macd_hist": round(macd_hist, 0),
-            "obv": f"{obv_change:+.1f}M",
-            "oi_change": f"{(float(oi['openInterest']) - float(oi['openInterest']) * 0.918):+.1f}%",  # упрощённо
-            "ls_ratio": round(float(ls_ratio['longShortRatio']), 2),
+            "ema_cross": ema_cross,
+            "macd": round(macd_line),
+            "macd_hist": round(macd_hist),
+            "poc_price": f"${poc_price:,.0f}",
+            "rsi_div": rsi_div,
+            "macd_div": macd_div,
+            "ls_ratio": round(float(ls['longShortRatio']), 2),
         }
+
     except Exception as e:
-        print(f"[BINANCE ERROR] {e}")
-        return {"error": "Data offline"}
+        print(f"[DATA ERROR] {e}")
+        return {"error": "Offline"}
 
+# === LIQUIDATION HEATMAP (Bybit) ===
+def get_liquidation_cluster(ticker: str) -> str:
+    try:
+        resp = requests.get(
+            f"{BYBIT_API_URL}/v5/market/recent-trade",
+            params={"category": "linear", "symbol": f"{ticker}USDT", "limit": 100},
+            timeout=5
+        ).json()
+        liq_prices = [float(t['price']) for t in resp.get('result', {}).get('list', []) if float(t['size']) > 500]
+        if liq_prices:
+            cluster = min(liq_prices) if len(set(liq_prices)) < 5 else "N/A"
+            return f"${round(cluster):,.0f}"
+    except:
+        pass
+    return "N/A"
+
+# === GROK AI ===
 def grok(ticker: str) -> dict:
-    
-    binance = get_binance_data(ticker)
-    if "error" in binance:
-        return {"signal":"HOLD","confidence":0,"reason":"Data offline"}
+    data = get_binance_data(ticker)
+    if "error" in data:
+        return {"signal": "HOLD", "confidence": 0, "reason": "Offline"}
 
-    prompt = f"""Q-Engine v2 — analyze {ticker}/USDT last 24h.
+    liq = get_liquidation_cluster(ticker)
 
-LIVE DATA:
-• Price: {binance['price']} ({binance['change']})
-• EMA-20: {binance['ema20']} | EMA-50: {binance['ema50']} → {'Bullish crossover' if binance['ema_cross'] == 'bull' else 'Bearish'}
-• MACD: {binance['macd']} (hist {binance['macd_hist']:+}) → {'Strong momentum' if binance['macd_hist'] > 0 else 'Weakening'}
-• RSI-14: {binance['rsi']} → {'Overbought' if binance['rsi'] > 70 else 'Oversold' if binance['rsi'] < 30 else 'Neutral'}
-• Volume: {binance['volume_spike']} | OBV: {binance['obv']} → Accumulation
-• Funding: {binance['funding']} | OI: {binance['oi_change']} → {'Longs building' if binance['oi_change'].startswith('+') else 'Shorts building'}
-• Long/Short Ratio: {binance['ls_ratio']} → {'Bulls dominate' if binance['ls_ratio'] > 1.2 else 'Bears dominate' if binance['ls_ratio'] < 0.8 else 'Balanced'}
+    prompt = f"""Analyze {ticker}/USDT 24h.
 
-Return ONLY valid JSON:
-{{
-  "signal": "LONG" or "SHORT" or "HOLD",
-  "target_pct": 3.0..14.0,
-  "stop_pct": -1.0..-3.5,
-  "confidence": 80..99,
-  "reason": "4–9 words | facts only"
-}}
+LIVE:
+• Price: {data['price']} ({data['change']})
+• EMA: {data['ema20']} | {data['ema50']} → {data['ema_cross'].upper()}
+• MACD: {data['macd']} (hist {data['macd_hist']:+})
+• RSI: {data['rsi']} → {data['rsi_div'].upper()}
+• Volume: {data['volume_spike']}
+• POC: {data['poc_price']}
+• Liquidation: {liq}
 
-No extra text. No markdown. No code blocks."""
+Return JSON:
+{{"signal": "LONG|SHORT|HOLD", "target_pct": 3.0..14.0, "stop_pct": -1.0..-3.5, "confidence": 80..99, "reason": "facts | only"}}"""
 
-    # === ШАГ 3: Отправляем в Grok с retry ===
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            print(f"[GROK] Попытка {attempt+1}/3 → {ticker}/USDT | Таймаут 30 сек")
             r = requests.post(
                 "https://api.x.ai/v1/chat/completions",
-                json={
-                    "model": "grok-4-latest",  
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 120
-                },
-                headers={"Authorization": f"Bearer {XAI}"},
+                json={"model": "grok-4-latest", "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 120},
+                headers={"Authorization": f"Bearer {XAI_API_KEY}"},
                 timeout=30
             )
-            print(f"[GROK] Status: {r.status_code}")
             r.raise_for_status()
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            print(f"[GROK] Raw: {raw[:120]}...")
-            
-            # Убираем ```json
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
-            
-            data = json.loads(raw)
-            print(f"[GROK] Parsed: {data}")
-
+            result = json.loads(raw)
             return {
-                "signal": str(data.get("signal","HOLD")).upper(),
-                "target_pct": round(float(data.get("target_pct",0)), 1),
-                "stop_pct": round(float(data.get("stop_pct",0)), 1),
-                "confidence": int(data.get("confidence",0)),
-                "reason": str(data.get("reason","No edge"))[:80].replace('|', ' | ')
+                "signal": result.get("signal", "HOLD").upper(),
+                "target_pct": round(float(result.get("target_pct", 0)), 1),
+                "stop_pct": round(float(result.get("stop_pct", 0)), 1),
+                "confidence": int(result.get("confidence", 0)),
+                "reason": result.get("reason", "No edge")[:80].replace('|', ' | ')
             }
-
-        except requests.exceptions.ReadTimeout:
-            print(f"[GROK RETRY] Timeout на попытке {attempt+1}")
-            if attempt == 2:
-                return {"signal":"HOLD","confidence":0,"reason":"Timeout"}
-            time.sleep(2)
-
-        except json.JSONDecodeError as e:
-            print(f"[GROK JSON ERROR] {e} | Raw: {raw[:100]}")
-            return {"signal":"HOLD","confidence":0,"reason":"JSON error"}
-
         except Exception as e:
-            print(f"[GROK ERROR] {type(e).__name__}: {e}")
-            return {"signal":"HOLD","confidence":0,"reason":"Offline"}
+            print(f"[GROK] {e}")
+            time.sleep(2)
+    return {"signal": "HOLD", "confidence": 0, "reason": "Timeout"}
 
-def make_reply(signal, ticker):
-    sig = signal.get("signal", "HOLD").upper()
-    target_pct = float(signal.get("target_pct", 0))
-    stop_pct = float(signal.get("stop_pct", 0))
-    conf = int(signal.get("confidence", 0))
-    reason = str(signal.get("reason", "No edge")).strip()
-
-    # Защита
-    if sig not in ["LONG", "SHORT", "HOLD"]:
-        sig = "HOLD"
-    if not (3.0 <= target_pct <= 14.0):
-        target_pct = 0.0
-    if not (-3.5 <= stop_pct <= -1.0):
-        stop_pct = 0.0
-    if not (80 <= conf <= 99):
-        conf = 0
-
-    # Данные с Binance — ЧИСТЫЕ ЧИСЛА
-    price_data = get_binance_data(ticker.replace('USDT',''))
-    raw_price = price_data.get('price', '0')
-    
-    # Убираем $ и запятые
-    try:
-        current_price = float(raw_price.replace('$', '').replace(',', ''))
-    except:
-        current_price = 0.0
-
-    # Форматируем цены
-    price = f"${current_price:,.0f}" if current_price > 0 else "N/A"
-    target_price = f"${current_price * (1 + target_pct/100):,.0f}" if current_price > 0 else "N/A"
-    stop_price = f"${current_price * (1 + stop_pct/100):,.0f}" if current_price > 0 else "N/A"
+# === REPLY ===
+def make_reply(signal: dict, ticker: str):
+    sig = signal["signal"]
+    data = get_binance_data(ticker)
+    price = data["price"]
+    target_price = price * (1 + signal["target_pct"]/100)
+    stop_price = price * (1 + signal["stop_pct"]/100)
 
     arrow = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
+    div = "DIVERGENCE!" if "div" in signal["reason"].lower() else ""
+    poc = f"POC: {data['poc_price']}" if 'poc_price' in data else ""
 
     text = f"""*{ticker}/USDT* → *{sig}* {arrow}
-Price: `{price}`
-Target: `{target_price}` (`{target_pct:+.1f}%`) | Stop: `{stop_price}` (`{stop_pct:+.1f}%`)
-Confidence: `{conf}%`
+Price: `${price:,.0f}`
+Target: `${target_price:,.0f}` (`{signal['target_pct']:+.1f}%`) | Stop: `${stop_price:,.0f}` (`{signal['stop_pct']:+.1f}%`)
+Confidence: `{signal['confidence']}%`
 
-_{reason.replace('|', ' | ')}_"""
+_{signal['reason']}_
 
-    # Только Update
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "Update", "callback_data": f"UPDATE {ticker}"}
-        ]]
-    }
-    return text, keyboard
+**{div} {poc}**
 
-def send(chat_id, text, keyboard=None, edit=None):
-    url = f"https://api.telegram.org/bot{TOKEN}/{'editMessageText' if edit else 'sendMessage'}"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if edit: payload["message_id"] = edit
-    if keyboard: payload["reply_markup"] = json.dumps(keyboard)
-    requests.post(url, json=payload, timeout=5)
+[ Update ]"""
 
-def answer_callback(qid, text="OK"):
-    requests.post(f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
-                  json={"callback_query_id": qid, "text": text}, timeout=5)
+    kb = {"inline_keyboard": [[{"text": "Update", "callback_data": f"UPDATE {ticker}"}]]}
+    return text, kb
 
-@app.route('/', methods=['POST'])
-@app.route('/webhook', methods=['POST'])
+# === WEBHOOK ===
+@app.route("/", methods=["POST"])
 def webhook():
-    print("[HOOK] ← ВХОДЯЩИЙ запрос от Telegram")
-    try:
-        update = request.get_json(force=True)
-        print(f"[HOOK] JSON получен: {json.dumps(update)[:200]}...")
-
-        if 'message' in update:
-            print("[HOOK] Это обычное сообщение")
-            msg = update['message']
-            chat_id = msg['chat']['id']
-            text = msg.get('text', '').strip().upper()
-            print(f"[HOOK] Текст от {chat_id}: {text}")
-
-            if text == '/START':
-                print("[HOOK] Отправляю приветствие")
-                send(chat_id, "Отправь тикер, например BTC")
-                return "OK", 200
-
-            if not (2 <= len(text) <= 10 and text.replace('USDT','').isalnum()):
-                print("[HOOK] Некорректный тикер")
-                send(chat_id, "Тикер: BTC, ETH, SOL…")
-                return "OK", 200
-
-            print(f"[HOOK] Отправляю '_Анализирую…_' для {text}")
-            send(chat_id, "_Анализирую…_")
-
-            print(f"[HOOK] → Запускаю grok({text.replace('USDT','')})")
-            signal = grok(text.replace('USDT',''))
-            print(f"[HOOK] ← grok вернул: {signal}")
-
+    update = request.get_json()
+    if "message" in update:
+        text = update["message"]["text"].strip().upper()
+        chat_id = update["message"]["chat"]["id"]
+        if text in ["BTC", "ETH", "SOL"]:
+            send_telegram(chat_id, "_Анализирую…_")
+            signal = grok(text)
             reply, kb = make_reply(signal, text)
-            print(f"[HOOK] Отправляю ответ с кнопками")
-            send(chat_id, reply, kb)
+            send_telegram(chat_id, reply, kb)
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        data = cq["data"]
+        chat_id = cq["message"]["chat"]["id"]
+        msg_id = cq["message"]["message_id"]
+        if data.startswith("UPDATE"):
+            ticker = data.split()[1]
+            send_telegram(chat_id, "_Обновляю…_", edit=msg_id)
+            signal = grok(ticker)
+            reply, kb = make_reply(signal, ticker)
+            send_telegram(chat_id, reply, kb, edit=msg_id)
+    return jsonify({"ok": True})
 
-        elif 'callback_query' in update:
-            print("[HOOK] Callback")
-            cq = update['callback_query']
-            data = cq['data']
-            chat_id = cq['message']['chat']['id']
-            msg_id = cq['message']['message_id']
-
-            if data.startswith("UPDATE"):
-                ticker = data.split()[1]
-                print(f"[HOOK] UPDATE {ticker}")
-                send(chat_id, "_Обновляю…_", edit=msg_id)
-                signal = grok(ticker)
-                reply, kb = make_reply(signal, ticker)
-                send(chat_id, reply, kb, edit=msg_id)
-                answer_callback(cq['id'], "Обновлено!")
-
-        else:
-            print("[HOOK] Неизвестный тип update")
-
-    except Exception as e:
-        error_msg = f"[FATAL ERROR] {type(e).__name__}: {e}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-
-    print("[HOOK] → Возвращаю OK")
-    return "OK", 200
-if __name__ == '__main__':
-    print("Q-Engine v2 — ЛОКАЛЬНЫЙ РЕЖИМ (без шифрования)")
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
