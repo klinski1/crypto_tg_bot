@@ -52,32 +52,45 @@ def grok(ticker: str) -> dict:
     if "error" in binance:
         return {"signal":"HOLD","confidence":0,"reason":"Data offline"}
 
-    prompt = f"""Q-Engine v2 | LIVE
-{ticker}/USDT
+    # ЧИСТЫЙ ПРОМПТ — БЕЗ JSON-ОШИБОК
+    prompt = f"""Q-Engine v2 — analyze {ticker}/USDT last 24h.
+
+LIVE DATA:
 • Price: {binance['price']} ({binance['change']})
 • RSI-14: {binance['rsi']}
-• Funding: {binance['funding']}
-• Volume: {binance['volume_spike']}
+• Funding Rate: {binance['funding']}
+• Volume spike: {binance['volume_spike']}
 
-Return ONLY JSON:
-{{
-  "signal": "LONG" | "SHORT" | "HOLD",
-  "target_pct": 3.0..14.0,
-  "stop_pct": -1.0..-3.5,
-  "confidence": 80..99,
-  "reason": "4–9 words | facts"
-}}"""
+Return ONLY valid JSON with these keys:
+"signal": "LONG" or "SHORT" or "HOLD"
+"target_pct": number between 3.0 and 14.0
+"stop_pct": number between -1.0 and -3.5
+"confidence": integer between 80 and 99
+"reason": string with 4-9 words, pipe-separated facts
+
+No extra text. No markdown. No code blocks."""
 
     try:
+        print(f"[GROK] Отправляю prompt: {prompt[:200]}...")
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
-            json={"model": "grok-4-fast-reasoning", "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 120},
-            headers={"Authorization": f"Bearer {XAI}"}, timeout=7
+            json={
+                "model": "grok-beta",  # ← БЕЗОПАСНАЯ МОДЕЛЬ
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 120
+            },
+            headers={"Authorization": f"Bearer {XAI}"},
+            timeout=7
         )
+        print(f"[GROK] Status: {r.status_code}")
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
-        if raw.startswith("```"): raw = raw.split("\n",1)[1].rsplit("\n",1)[0]
+        print(f"[GROK] Raw response: {raw}")
+        if raw.startswith("```"):
+            raw = raw.split("\n",1)[1].rsplit("\n",1)[0].strip()
         data = json.loads(raw)
+        print(f"[GROK] Parsed: {data}")
 
         return {
             "signal": str(data.get("signal","HOLD")).upper(),
@@ -86,10 +99,16 @@ Return ONLY JSON:
             "confidence": int(data.get("confidence",0)),
             "reason": str(data.get("reason","No edge"))[:80]
         }
+    except requests.exceptions.HTTPError as e:
+        print(f"[GROK HTTP] {r.status_code}: {r.text}")
+        return {"signal":"HOLD","confidence":0,"reason":"HTTP error"}
+    except json.JSONDecodeError as e:
+        print(f"[GROK JSON] Invalid JSON: {raw[:100]}...")
+        return {"signal":"HOLD","confidence":0,"reason":"JSON error"}
     except Exception as e:
-        print(e)
+        print(f"[GROK] {type(e).__name__}: {e}")
         return {"signal":"HOLD","confidence":0,"reason":"Offline"}
-
+    
 def make_reply(signal, ticker):
     # Защита от кривого ответа Grok
     sig = signal.get("signal", "HOLD").upper()
