@@ -52,7 +52,6 @@ def grok(ticker: str) -> dict:
     if "error" in binance:
         return {"signal":"HOLD","confidence":0,"reason":"Data offline"}
 
-    # ЧИСТЫЙ ПРОМПТ — БЕЗ JSON-ОШИБОК
     prompt = f"""Q-Engine v2 — analyze {ticker}/USDT last 24h.
 
 LIVE DATA:
@@ -70,45 +69,44 @@ Return ONLY valid JSON with these keys:
 
 No extra text. No markdown. No code blocks."""
 
-    try:
-        print(f"[GROK] Отправляю prompt: {prompt[:200]}...")
-        r = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            json={
-                "model": "grok-beta",  # ← БЕЗОПАСНАЯ МОДЕЛЬ
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 120
-            },
-            headers={"Authorization": f"Bearer {XAI}"},
-            timeout=7
-        )
-        print(f"[GROK] Status: {r.status_code}")
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        print(f"[GROK] Raw response: {raw}")
-        if raw.startswith("```"):
-            raw = raw.split("\n",1)[1].rsplit("\n",1)[0].strip()
-        data = json.loads(raw)
-        print(f"[GROK] Parsed: {data}")
-
-        return {
-            "signal": str(data.get("signal","HOLD")).upper(),
-            "target_pct": round(float(data.get("target_pct",0)),1),
-            "stop_pct": round(float(data.get("stop_pct",0)),1),
-            "confidence": int(data.get("confidence",0)),
-            "reason": str(data.get("reason","No edge"))[:80]
-        }
-    except requests.exceptions.HTTPError as e:
-        print(f"[GROK HTTP] {r.status_code}: {r.text}")
-        return {"signal":"HOLD","confidence":0,"reason":"HTTP error"}
-    except json.JSONDecodeError as e:
-        print(f"[GROK JSON] Invalid JSON: {raw[:100]}...")
-        return {"signal":"HOLD","confidence":0,"reason":"JSON error"}
-    except Exception as e:
-        print(f"[GROK] {type(e).__name__}: {e}")
-        return {"signal":"HOLD","confidence":0,"reason":"Offline"}
-    
+    # Retry с увеличенным таймаутом (до 30 сек)
+    for attempt in range(3):
+        try:
+            print(f"[GROK] Попытка {attempt+1}/3, таймаут 30 сек")
+            r = requests.post(
+                "https://api.x.ai/v1/chat/completions",
+                json={
+                    "model": "grok-4-latest",  # ← Стабильная модель
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 120
+                },
+                headers={"Authorization": f"Bearer {XAI}"},
+                timeout=30  # ← УВЕЛИЧИЛИ ДО 30 СЕК
+            )
+            print(f"[GROK] Status: {r.status_code}")
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            print(f"[GROK] Raw: {raw[:100]}...")
+            if raw.startswith("```"):
+                raw = raw.split("\n",1)[1].rsplit("\n",1)[0].strip()
+            data = json.loads(raw)
+            print(f"[GROK] Parsed: {data}")
+            return {
+                "signal": str(data.get("signal","HOLD")).upper(),
+                "target_pct": round(float(data.get("target_pct",0)),1),
+                "stop_pct": round(float(data.get("stop_pct",0)),1),
+                "confidence": int(data.get("confidence",0)),
+                "reason": str(data.get("reason","No edge"))[:80]
+            }
+        except requests.exceptions.ReadTimeout as e:
+            print(f"[GROK RETRY] Timeout на попытке {attempt+1}: {e}")
+            if attempt == 2:
+                return {"signal":"HOLD","confidence":0,"reason":"Timeout"}
+            time.sleep(2)  # Пауза перед retry
+        except Exception as e:
+            print(f"[GROK ERROR] {type(e).__name__}: {e}")
+            return {"signal":"HOLD","confidence":0,"reason":"Offline"}   
 def make_reply(signal, ticker):
     # Защита от кривого ответа Grok
     sig = signal.get("signal", "HOLD").upper()
