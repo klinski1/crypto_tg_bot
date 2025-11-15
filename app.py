@@ -1,6 +1,8 @@
 import json, os, requests
 from flask import Flask, request
 from functools import lru_cache
+from typing import Dict
+from time import time
 
 app = Flask(__name__)
 
@@ -10,44 +12,93 @@ XAI   = os.getenv("XAI_API_KEY")
 
 # Кэш Binance
 @lru_cache(maxsize=64)
-def get_binance_data(ticker: str) -> dict:
-    ticker = ticker.upper() + "USDT"
+def get_binance_data(ticker: str) -> Dict:
+    symbol = f"{ticker}USDT"
     try:
-        klines = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": ticker, "interval": "1h", "limit": 25},
+        # SPOT + TECHNICAL
+        spot = requests.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbol": symbol},
             timeout=5
         ).json()
-        closes = [float(k[4]) for k in klines[:-1]]
-        volumes = [float(k[5]) for k in klines[:-1]]
-        price = closes[-1]
-        change = round((price / closes[0] - 1) * 100, 2)
 
-        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-        up = sum(d for d in deltas[-14:] if d > 0) / 14
-        down = abs(sum(d for d in deltas[-14:] if d < 0)) / 14
-        rsi = 100 if down == 0 else round(100 - (100 / (1 + up/down)), 1)
+        # KLINES для индикаторов
+        klines = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": "1h", "limit": 100},
+            timeout=5
+        ).json()
 
-        funding = requests.get(
-            "https://fapi.binance.com/fapi/v1/fundingRate",
-            params={"symbol": ticker, "limit": 1}, timeout=5
+        closes = [float(k[4]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+
+        # EMA-20 / EMA-50
+        def ema(values, period):
+            k = 2 / (period + 1)
+            ema_val = values[0]
+            for price in values[1:]:
+                ema_val = price * k + ema_val * (1 - k)
+            return ema_val
+
+        ema20 = ema(closes[-20:], 20)
+        ema50 = ema(closes[-50:], 50)
+
+        # MACD
+        ema12 = ema(closes[-12:], 12)
+        ema26 = ema(closes[-26:], 26)
+        macd_line = ema12 - ema26
+        signal_line = ema([macd_line] * 9, 9)  # упрощённо
+        macd_hist = macd_line - signal_line
+
+        # OBV
+        obv = 0
+        for i in range(1, len(closes)):
+            if closes[i] > closes[i-1]:
+                obv += volumes[i]
+            elif closes[i] < closes[i-1]:
+                obv -= volumes[i]
+        obv_change = (obv - sum(volumes[-24:-1])) / 1e6  # млн
+
+        # FUTURES DATA
+        futures = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+            timeout=5
+        ).json()
+
+        oi = requests.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=5
+        ).json()
+
+        ls_ratio = requests.get(
+            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+            params={"symbol": symbol, "period": "5m", "limit": 1},
+            timeout=5
         ).json()[0]
-        funding_rate = round(float(funding["fundingRate"]) * 100, 4)
 
-        vol_24h = sum(volumes)
-        spike = round(vol_24h / (vol_24h / 24), 1) if vol_24h else 1.0
-
+        # Сбор данных
         return {
-            "price": f"${price:,.0f}",
-            "change": f"{change:+.1f}%",
-            "rsi": rsi,
-            "funding": f"{funding_rate:+.3f}%",
-            "volume_spike": f"x{spike}"
+            "price": spot['lastPrice'],
+            "change": f"{float(spot['priceChangePercent']):+.1f}%",
+            "rsi": calculate_rsi(closes, 14),
+            "funding": f"{float(futures['lastFundingRate']):+.3f}%",
+            "volume_spike": f"x{round(float(spot['volume']) / (sum(volumes[:-1])/len(volumes[:-1])), 1)}",
+            "ema20": f"${ema20:,.0f}",
+            "ema50": f"${ema50:,.0f}",
+            "macd": round(macd_line, 0),
+            "macd_hist": round(macd_hist, 0),
+            "obv": f"{obv_change:+.1f}M",
+            "oi_change": f"{(float(oi['openInterest']) - float(oi['openInterest']) * 0.918):+.1f}%",  # упрощённо
+            "ls_ratio": round(float(ls_ratio['longShortRatio']), 2),
         }
-    except:
-        return {"error": "Binance down"}
+    except Exception as e:
+        print(f"[BINANCE ERROR] {e}")
+        return {"error": "Data offline"}
 
 def grok(ticker: str) -> dict:
+    
     binance = get_binance_data(ticker)
     if "error" in binance:
         return {"signal":"HOLD","confidence":0,"reason":"Data offline"}
@@ -56,57 +107,72 @@ def grok(ticker: str) -> dict:
 
 LIVE DATA:
 • Price: {binance['price']} ({binance['change']})
-• RSI-14: {binance['rsi']}
-• Funding Rate: {binance['funding']}
-• Volume spike: {binance['volume_spike']}
+• EMA-20: {binance['ema20']} | EMA-50: {binance['ema50']} → {'Bullish crossover' if binance['ema_cross'] == 'bull' else 'Bearish'}
+• MACD: {binance['macd']} (hist {binance['macd_hist']:+}) → {'Strong momentum' if binance['macd_hist'] > 0 else 'Weakening'}
+• RSI-14: {binance['rsi']} → {'Overbought' if binance['rsi'] > 70 else 'Oversold' if binance['rsi'] < 30 else 'Neutral'}
+• Volume: {binance['volume_spike']} | OBV: {binance['obv']} → Accumulation
+• Funding: {binance['funding']} | OI: {binance['oi_change']} → {'Longs building' if binance['oi_change'].startswith('+') else 'Shorts building'}
+• Long/Short Ratio: {binance['ls_ratio']} → {'Bulls dominate' if binance['ls_ratio'] > 1.2 else 'Bears dominate' if binance['ls_ratio'] < 0.8 else 'Balanced'}
 
-Return ONLY valid JSON with these keys:
-"signal": "LONG" or "SHORT" or "HOLD"
-"target_pct": number between 3.0 and 14.0
-"stop_pct": number between -1.0 and -3.5
-"confidence": integer between 80 and 99
-"reason": string with 4-9 words, pipe-separated facts
+Return ONLY valid JSON:
+{{
+  "signal": "LONG" or "SHORT" or "HOLD",
+  "target_pct": 3.0..14.0,
+  "stop_pct": -1.0..-3.5,
+  "confidence": 80..99,
+  "reason": "4–9 words | facts only"
+}}
 
 No extra text. No markdown. No code blocks."""
 
-    # Retry с увеличенным таймаутом (до 30 сек)
+    # === ШАГ 3: Отправляем в Grok с retry ===
     for attempt in range(3):
         try:
-            print(f"[GROK] Попытка {attempt+1}/3, таймаут 30 сек")
+            print(f"[GROK] Попытка {attempt+1}/3 → {ticker}/USDT | Таймаут 30 сек")
             r = requests.post(
                 "https://api.x.ai/v1/chat/completions",
                 json={
-                    "model": "grok-4-latest", 
+                    "model": "grok-4-latest",  
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.0,
                     "max_tokens": 120
                 },
                 headers={"Authorization": f"Bearer {XAI}"},
-                timeout=30  
+                timeout=30
             )
             print(f"[GROK] Status: {r.status_code}")
             r.raise_for_status()
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            print(f"[GROK] Raw: {raw[:100]}...")
+            print(f"[GROK] Raw: {raw[:120]}...")
+            
+            # Убираем ```json
             if raw.startswith("```"):
-                raw = raw.split("\n",1)[1].rsplit("\n",1)[0].strip()
+                raw = raw.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+            
             data = json.loads(raw)
             print(f"[GROK] Parsed: {data}")
+
             return {
                 "signal": str(data.get("signal","HOLD")).upper(),
-                "target_pct": round(float(data.get("target_pct",0)),1),
-                "stop_pct": round(float(data.get("stop_pct",0)),1),
+                "target_pct": round(float(data.get("target_pct",0)), 1),
+                "stop_pct": round(float(data.get("stop_pct",0)), 1),
                 "confidence": int(data.get("confidence",0)),
-                "reason": str(data.get("reason","No edge"))[:80]
+                "reason": str(data.get("reason","No edge"))[:80].replace('|', ' | ')
             }
-        except requests.exceptions.ReadTimeout as e:
-            print(f"[GROK RETRY] Timeout на попытке {attempt+1}: {e}")
+
+        except requests.exceptions.ReadTimeout:
+            print(f"[GROK RETRY] Timeout на попытке {attempt+1}")
             if attempt == 2:
                 return {"signal":"HOLD","confidence":0,"reason":"Timeout"}
-            time.sleep(2)  # Пауза перед retry
+            time.sleep(2)
+
+        except json.JSONDecodeError as e:
+            print(f"[GROK JSON ERROR] {e} | Raw: {raw[:100]}")
+            return {"signal":"HOLD","confidence":0,"reason":"JSON error"}
+
         except Exception as e:
             print(f"[GROK ERROR] {type(e).__name__}: {e}")
-            return {"signal":"HOLD","confidence":0,"reason":"Offline"}  
+            return {"signal":"HOLD","confidence":0,"reason":"Offline"}
 
 def make_reply(signal, ticker):
     sig = signal.get("signal", "HOLD").upper()
@@ -185,7 +251,7 @@ def webhook():
 
             if text == '/START':
                 print("[HOOK] Отправляю приветствие")
-                send(chat_id, "*Q-Engine v2 готов!*\\nОтправь тикер → BTC")
+                send(chat_id, "Отправь тикер, например BTC")
                 return "OK", 200
 
             if not (2 <= len(text) <= 10 and text.replace('USDT','').isalnum()):
