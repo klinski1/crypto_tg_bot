@@ -125,12 +125,20 @@ def make_reply(signal, ticker):
     if not (80 <= conf <= 99):
         conf = 0
 
-    # Цена
+    # Данные с Binance — ЧИСТЫЕ ЧИСЛА
     price_data = get_binance_data(ticker.replace('USDT',''))
-    price = f"${float(price_data['price']):,.0f}"
-    current_price = float(price_data['price'])
-    target_price = f"${current_price * (1 + target_pct/100):,.0f}"
-    stop_price = f"${current_price * (1 + stop_pct/100):,.0f}"
+    raw_price = price_data.get('price', '0')
+    
+    # Убираем $ и запятые
+    try:
+        current_price = float(raw_price.replace('$', '').replace(',', ''))
+    except:
+        current_price = 0.0
+
+    # Форматируем цены
+    price = f"${current_price:,.0f}" if current_price > 0 else "N/A"
+    target_price = f"${current_price * (1 + target_pct/100):,.0f}" if current_price > 0 else "N/A"
+    stop_price = f"${current_price * (1 + stop_pct/100):,.0f}" if current_price > 0 else "N/A"
 
     arrow = "UP" if sig == "LONG" else "DOWN" if sig == "SHORT" else "NEUTRAL"
 
@@ -141,7 +149,7 @@ Confidence: `{conf}%`
 
 _{reason.replace('|', ' | ')}_"""
 
-    # ТОЛЬКО UPDATE
+    # Только Update
     keyboard = {
         "inline_keyboard": [[
             {"text": "Update", "callback_data": f"UPDATE {ticker}"}
