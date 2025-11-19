@@ -116,73 +116,110 @@ def get_binance_data(ticker: str) -> Dict[str, Any]:
         print(f"[BINANCE ERROR] {e}")
         return {"error": "Offline"}
 
-# === GROK ===
+# === GROK С ЗАЩИТОЙ ОТ ТАЙМАУТОВ И ПАДЕНИЙ ===
 def grok(ticker: str) -> dict:
     data = get_binance_data(ticker)
     if "error" in data:
-        return {"signal": "HOLD", "confidence": 0, "reason": "Data offline"}
+        return {"signal": "HOLD", "confidence": 0, "reason": "Binance offline"}
 
-    prompt = f"""Analyze {ticker}/USDT 24h.
+    prompt = f"""Analyze {ticker}/USDT.
 
-LIVE:
-• Price: {data['price']} ({data['change']})
-• EMA: {data['ema20']} | {data['ema50']} → {data['ema_cross'].upper()}
-• MACD: {data['macd']} (hist {data['macd_hist']:+})
-• RSI: {data['rsi']}
-• Volume: {data['volume_spike']}
-• Funding: {data['funding']}
-• L/S: {data['ls_ratio']}
-• POC: {data['poc_price']}
+Price: {data['price']} | Change: {data['change']}
+EMA20: {data['ema20']} EMA50: {data['ema50']} → {data['ema_cross'].upper()}
+MACD: {data['macd']} (hist {data['macd_hist']:+})
+RSI: {data['rsi']} | Volume: {data['volume_spike']}
+Funding: {data['funding']} | L/S: {data['ls_ratio']}
+POC: {data['poc_price']}
 
-Return JSON:
-{{"signal": "LONG|SHORT|HOLD", "target_pct": 3.0..14.0, "stop_pct": -1.0..-3.5, "confidence": 80..99, "reason": "facts"}}"""
+Return ONLY valid JSON (no markdown):
+{{"signal":"LONG","target_pct":6.5,"stop_pct":-2.0,"confidence":94,"reason":"EMA bear cross + MACD neg"}}
+or
+{{"signal":"SHORT","target_pct":5.8,"stop_pct":-2.2,"confidence":91,"reason":"RSI overbought + bear div"}}
+or
+{{"signal":"HOLD","confidence":0,"reason":"No edge"}}"""
 
-    for _ in range(3):
-        try:
-            r = requests.post(
-                "https://api.x.ai/v1/chat/completions",
-                json={
-                    "model": "grok-4-latest",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 120
-                },
-                headers={"Authorization": f"Bearer {XAI_API_KEY}"},
-                timeout=30
-            )
-            r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"].strip()
-            if "```" in raw:
-                raw = raw.split("```", 2)[1] if "json" in raw.lower() else raw
-            result = json.loads(raw)
-            return {
-                "signal": result.get("signal", "HOLD").upper(),
-                "target_pct": round(float(result.get("target_pct", 0)), 1),
-                "stop_pct": round(float(result.get("stop_pct", 0)), 1),
-                "confidence": int(result.get("confidence", 0)),
-                "reason": result.get("reason", "No edge")[:80]
-            }
-        except Exception as e:
-            print(f"[GROK] {e}")
-            time.sleep(2)
-    return {"signal": "HOLD", "confidence": 0, "reason": "Timeout"}
+    # ДЕЛАЕМ ТОЛЬКО 1 ПОПЫТКУ + УВЕЛИЧИВАЕМ ТАЙМАУТ ДО 45 сек
+    try:
+        r = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            json={
+                "model": "grok-4-latest",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 120
+            },
+            headers={"Authorization": f"Bearer {XAI_API_KEY}"},
+            timeout=45  
+        )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
 
-# === REPLY ===
+        # Убираем мусор
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1].split("```", 1)[0].strip()
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+
+        result = json.loads(raw)
+
+        # ЗАЩИТА: если что-то не так — HOLD
+        if not all(k in result for k in ["signal", "target_pct", "stop_pct", "confidence"]):
+            raise ValueError("Missing fields")
+
+        return {
+            "signal": str(result.get("signal", "HOLD")).upper(),
+            "target_pct": float(result.get("target_pct", 0)),
+            "stop_pct": float(result.get("stop_pct", 0)),
+            "confidence": int(result.get("confidence", 0)),
+            "reason": str(result.get("reason", "No edge"))[:100]
+        }
+
+    except Exception as e:
+        print(f"[GROK] Ошибка: {e} → возвращаю HOLD")
+        return {"signal": "HOLD", "confidence": 0, "reason": "Grok timeout"}
+    
+# === MAKE_REPLY С ПОЛНОЙ ЗАЩИТОЙ ===
 def make_reply(signal: dict, ticker: str):
+    # Если HOLD — сразу безопасный ответ
+    if signal["signal"] == "HOLD" or signal["confidence"] == 0:
+        text = f"""*{ticker}/USDT* → *HOLD*
+Price: `${get_binance_data(ticker).get('price', 0):,.0f}`
+Confidence: 0%
+
+_{signal['reason']}_
+
+[ Update ]"""
+        kb = {"inline_keyboard": [[{"text": "Update", "callback_data": f"UPDATE {ticker}"}]]}
+        return text, kb
+
     data = get_binance_data(ticker)
     if "error" in data:
-        return "_Данные недоступны…_", None
+        return "_Сервис временно недоступен…_", None
 
     price = data["price"]
-    target_price = price * (1 + signal["target_pct"]/100)
-    stop_price = price * (1 + signal["stop_pct"]/100)
+    direction = signal["signal"]
 
-    arrow = "UP" if signal["signal"] == "LONG" else "DOWN" if signal["signal"] == "SHORT" else "NEUTRAL"
+    # Абсолютные значения
+    tp_pct = abs(float(signal["target_pct"]))
+    sl_pct = abs(float(signal["stop_pct"]))
+
+    if direction == "LONG":
+        target_price = price * (1 + tp_pct / 100)
+        stop_price   = price * (1 - sl_pct / 100)
+        target_sign  = f"+{tp_pct:.1f}"
+        stop_sign    = f"-{sl_pct:.1f}"
+    else:  # SHORT
+        target_price = price * (1 - tp_pct / 100)
+        stop_price   = price * (1 + sl_pct / 100)
+        target_sign  = f"-{tp_pct:.1f}"
+        stop_sign    = f"+{sl_pct:.1f}"
+
+    arrow = "UP" if direction == "LONG" else "DOWN"
     poc = f"POC: {data['poc_price']}"
 
-    text = f"""*{ticker}/USDT* → *{signal['signal']}* {arrow}
+    text = f"""*{ticker}/USDT* → *{direction}* {arrow}
 Price: `${price:,.0f}`
-Target: `${target_price:,.0f}` (`{signal['target_pct']:+.1f}%`) | Stop: `${stop_price:,.0f}` (`{signal['stop_pct']:+.1f}%`)
+Target: `${target_price:,.0f}` (`{target_sign}%`) | Stop: `${stop_price:,.0f}` (`{stop_sign}%`)
 Confidence: `{signal['confidence']}%`
 
 _{signal['reason']}_
