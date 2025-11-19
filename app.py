@@ -120,7 +120,7 @@ POC: {data['poc_price']}
             "https://api.x.ai/v1/chat/completions",
             json={"model": "grok-4-latest", "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 140},
             headers={"Authorization": f"Bearer {XAI_API_KEY}"},
-            timeout=45
+            timeout=120
         )
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
